@@ -1,0 +1,29 @@
+receivers:
+  opentsdb:
+    listenerAddr: ":4242"
+#    httpListenerAddr: ":4242"
+  otlp:
+    protocols:
+      grpc:
+
+processors:
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8080"
+    namespace: test-space
+    const_labels:
+      label1: value1
+      "another label": spaced value
+    send_timestamps: true
+    metric_expiration: 180m
+    enable_open_metrics: true
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp,opentsdb]
+      processors: []
+      exporters: [prometheus]
