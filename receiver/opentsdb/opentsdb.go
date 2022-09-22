@@ -17,9 +17,12 @@ import (
 	"fmt"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
 	"io"
 	"net/http"
+	"time"
 
 	telnetParser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentsdb"
 	httpParser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentsdbhttp"
@@ -38,8 +41,8 @@ type opentsdbReceiver struct {
 	settings component.ReceiverCreateSettings
 }
 
-func HttpPutHandler(consumer consumer.Metrics) func(req *http.Request) error {
-	rowProcessorFunc := processHttpRows(consumer)
+func HttpPutHandler(ctx context.Context, consumer consumer.Metrics) func(req *http.Request) error {
+	rowProcessorFunc := processHttpRows(ctx, consumer)
 	return func(req *http.Request) error {
 		path := req.URL.Path
 		switch path {
@@ -53,69 +56,97 @@ func HttpPutHandler(consumer consumer.Metrics) func(req *http.Request) error {
 	}
 }
 
-func TelnetPutHandler(consumer consumer.Metrics) func(r io.Reader) error {
+func TelnetPutHandler(ctx context.Context, consumer consumer.Metrics) func(r io.Reader) error {
 	return func(r io.Reader) error {
-		return telnetParser.ParseStream(r, processTelnetRows(consumer))
+		return telnetParser.ParseStream(r, processTelnetRows(ctx, consumer))
 	}
 }
 
-func mapTags(tags []httpParser.Tag) []telnetParser.Tag {
-	var t []telnetParser.Tag
-	for _, v := range tags {
-		t = append(t, telnetParser.Tag{Key: v.Key, Value: v.Value})
-	}
-	return t
-}
-
-func processHttpRows(consumer consumer.Metrics) func(rows []httpParser.Row) error {
+func processHttpRows(ctx context.Context, consumer consumer.Metrics) func(rows []httpParser.Row) error {
 	return func(rows []httpParser.Row) error {
+		metrics := pmetric.NewMetrics()
+		rm := metrics.ResourceMetrics().AppendEmpty()
 		for _, r := range rows {
-			if err := processRow(telnetParser.Row{
-				Metric:    r.Metric,
-				Tags:      mapTags(r.Tags),
-				Timestamp: r.Timestamp,
-				Value:     r.Value,
-			}); err != nil {
+			m, err := buildHttpMetric(r)
+			if err != nil {
 				return err
 			}
-
+			m.CopyTo(rm.ScopeMetrics().AppendEmpty())
+		}
+		err := consumer.ConsumeMetrics(ctx, metrics)
+		if err != nil {
+			return err
 		}
 		return nil
 	}
 }
 
-func processTelnetRows(consumer consumer.Metrics) func(rows []telnetParser.Row) error {
+func processTelnetRows(ctx context.Context, consumer consumer.Metrics) func(rows []telnetParser.Row) error {
 	return func(rows []telnetParser.Row) error {
+		metrics := pmetric.NewMetrics()
+		rm := metrics.ResourceMetrics().AppendEmpty()
 		for _, r := range rows {
-			if err := processRow(r); err != nil {
+			m, err := buildTelnetMetric(r)
+			if err != nil {
 				return err
 			}
+			m.CopyTo(rm.ScopeMetrics().AppendEmpty())
+		}
+		err := consumer.ConsumeMetrics(ctx, metrics)
+		if err != nil {
+			return err
 		}
 		return nil
 	}
 }
 
-func processRow(row telnetParser.Row) error {
-	fmt.Printf("%v\n", row)
-	return nil
+func buildHttpMetric(row httpParser.Row) (pmetric.ScopeMetrics, error) {
+	ilm := pmetric.NewScopeMetrics()
+	nm := ilm.Metrics().AppendEmpty()
+	nm.SetName(row.Metric)
+	nm.SetEmptyGauge()
+	//dp := nm.Sum().DataPoints().AppendEmpty()
+	g := nm.Gauge()
+	dp := g.DataPoints().AppendEmpty()
+	dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(0, row.Timestamp*1000000)))
+	dp.SetDoubleVal(row.Value)
+	for _, v := range row.Tags {
+		dp.Attributes().PutString(v.Key, v.Value)
+	}
+	return ilm, nil
 }
 
-func (r *opentsdbReceiver) Start(_ context.Context, host component.Host) error {
+func buildTelnetMetric(row telnetParser.Row) (pmetric.ScopeMetrics, error) {
+	ilm := pmetric.NewScopeMetrics()
+	nm := ilm.Metrics().AppendEmpty()
+	nm.SetName(row.Metric)
+	//dp := nm.Sum().DataPoints().AppendEmpty()
+	g := nm.Gauge()
+	dp := g.DataPoints().AppendEmpty()
+	dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(row.Timestamp, 0)))
+	dp.SetDoubleVal(row.Value)
+	for _, v := range row.Tags {
+		dp.Attributes().PutString(v.Key, v.Value)
+	}
+	return ilm, nil
+}
+
+func (r *opentsdbReceiver) Start(ctx context.Context, host component.Host) error {
 	r.logger.Info("starting OpenTSDB receiver")
 
 	var err error
 	if len(r.config.ListenerAddr) > 0 {
 		r.telnetServer, err = opentsdb.MustStart(r.config.ListenerAddr,
-			TelnetPutHandler(r.nextConsumer),
-			HttpPutHandler(r.nextConsumer),
+			TelnetPutHandler(ctx, r.nextConsumer),
+			HttpPutHandler(ctx, r.nextConsumer),
 			host)
 		if err != nil {
 			return err
 		}
-	}
-	if len(r.config.HttpListenerAddr) > 0 {
+	} else if len(r.config.HttpListenerAddr) > 0 {
+		//telnet starts http handler on same port, so this is only used if telnet is disabled
 		r.httpServer, err = opentsdbhttp.MustStart(r.config.HttpListenerAddr,
-			HttpPutHandler(r.nextConsumer),
+			HttpPutHandler(ctx, r.nextConsumer),
 			host)
 		if err != nil {
 			return err
